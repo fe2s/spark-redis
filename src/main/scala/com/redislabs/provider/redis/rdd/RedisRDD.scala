@@ -23,12 +23,9 @@ class RedisKVRDD(prev: RDD[String],
 
   override def compute(split: Partition, context: TaskContext): Iterator[(String, String)] = {
     val partition: RedisPartition = split.asInstanceOf[RedisPartition]
-    val sPos = partition.slots._1
-    val ePos = partition.slots._2
+    val (sPos, ePos) = partition.slots
     val nodes = partition.redisConfig.getNodesBySlots(sPos, ePos)
     val keys = firstParent[String].iterator(split, context)
-    val auth = partition.redisConfig.getAuth
-    val db = partition.redisConfig.getDB
     rddType match {
       case "kv" => getKV(nodes, keys)
       case "hash" => getHASH(nodes, keys)
@@ -57,6 +54,36 @@ class RedisKVRDD(prev: RDD[String],
       res
     }
   }
+}
+
+class RedisByteKVRDD(prev: RDD[Array[Byte]],
+                     val rddType: String,
+                     implicit val readWriteConfig: ReadWriteConfig)
+  extends RDD[(Array[Byte], Array[Byte])](prev) with Keys {
+
+  override def getPartitions: Array[Partition] = prev.partitions
+
+  override def compute(split: Partition, context: TaskContext): Iterator[(Array[Byte], Array[Byte])] = {
+    val partition: RedisPartition = split.asInstanceOf[RedisPartition]
+    val (sPos, ePos) = partition.slots
+    val nodes = partition.redisConfig.getNodesBySlots(sPos, ePos)
+    val keys = firstParent[Array[Byte]].iterator(split, context)
+    rddType match {
+      //      case "kv" => getKV(nodes, keys)
+      case "hash" => getHASH(nodes, keys)
+    }
+  }
+
+  def getHASH(nodes: Array[RedisNode], keys: Iterator[Array[Byte]]): Iterator[(Array[Byte], Array[Byte])] = {
+    groupByteKeysByNode(nodes, keys).flatMap { case (node, nodeKeys) =>
+      val conn = node.endpoint.connect()
+      val hashKeys = filterKeysByType(conn, nodeKeys, "hash")
+      val res = hashKeys.flatMap(conn.hgetAll).iterator
+      conn.close()
+      res
+    }
+  }
+
 }
 
 class RedisListRDD(prev: RDD[String],
@@ -172,13 +199,13 @@ class RedisZSetRDD[T: ClassTag](prev: RDD[String],
   }
 }
 
-class RedisKeysRDD(sc: SparkContext,
-                   val redisConfig: RedisConfig,
-                   implicit val readWriteConfig: ReadWriteConfig,
-                   val keyPattern: String = "*",
-                   val partitionNum: Int = 3,
-                   val keys: Array[String] = null)
-  extends RDD[String](sc, Seq.empty) with Keys {
+/**
+  * Base class for Keys RDD, subclasses represent String keys and Byte Array keys
+  */
+abstract class BaseRedisKeysRDD[T](sc: SparkContext,
+                                   val redisConfig: RedisConfig,
+                                   val partitionNum: Int = 3)
+  extends RDD[T](sc, Seq.empty) with Keys {
 
   override protected def getPreferredLocations(split: Partition): Seq[String] = {
     Seq(split.asInstanceOf[RedisPartition].redisConfig.initialAddr)
@@ -242,6 +269,18 @@ class RedisKeysRDD(sc: SparkContext,
         (hosts(i)._3, hosts(i)._4)).asInstanceOf[Partition]
     }).toArray
   }
+}
+
+/**
+  * Keys RDD created either from a key pattern or an array of string keys
+  */
+class RedisKeysRDD(sc: SparkContext,
+                   override val redisConfig: RedisConfig,
+                   implicit val readWriteConfig: ReadWriteConfig,
+                   val keyPattern: String = "*",
+                   override val partitionNum: Int = 3,
+                   val keys: Array[String] = null)
+  extends BaseRedisKeysRDD[String](sc, redisConfig, partitionNum) {
 
   override def compute(split: Partition, context: TaskContext): Iterator[String] = {
     val partition: RedisPartition = split.asInstanceOf[RedisPartition]
@@ -297,6 +336,13 @@ class RedisKeysRDD(sc: SparkContext,
     */
   def getHash(): RDD[(String, String)] = {
     new RedisKVRDD(this, "hash", readWriteConfig)
+  }
+
+  /**
+    * filter the 'hash' type keys and get all the elements of them as byte array
+    */
+  def getByteHash(): RDD[(Array[Byte], Array[Byte])] = {
+    new RedisByteKVRDD(this.map(_.getBytes()), "hash", readWriteConfig)
   }
 
   /**
@@ -365,6 +411,34 @@ class RedisKeysRDD(sc: SparkContext,
   def getZSetByScoreWithScore(min: Double, max: Double): RDD[(String, Double)] = {
     val zsetContext: ZSetContext = new ZSetContext(0, -1, min, max, true, "byScore")
     new RedisZSetRDD(this, zsetContext, classOf[(String, Double)], readWriteConfig)
+  }
+}
+
+/**
+  * Keys RDD created from an array of keys, where key is a byte array
+  */
+class RedisByteKeysRDD(sc: SparkContext,
+                       override val redisConfig: RedisConfig,
+                       implicit val readWriteConfig: ReadWriteConfig,
+                       override val partitionNum: Int = 3,
+                       val keys: Array[Array[Byte]])
+  extends BaseRedisKeysRDD[Array[Byte]](sc, redisConfig, partitionNum) {
+
+  override def compute(split: Partition, context: TaskContext): Iterator[Array[Byte]] = {
+    val partition = split.asInstanceOf[RedisPartition]
+    val (sPos, ePos) = partition.slots
+
+    keys.filter { key =>
+      val slot = JedisClusterCRC16.getSlot(key)
+      slot >= sPos && slot <= ePos
+    }.iterator
+  }
+
+  /**
+    * filter the 'hash' type keys and get all the elements of them
+    */
+  def getHash(): RDD[(Array[Byte], Array[Byte])] = {
+    new RedisByteKVRDD(this, "hash", readWriteConfig)
   }
 }
 
@@ -454,18 +528,54 @@ trait Keys {
     */
   def getMasterNode(nodes: Array[RedisNode], key: String): RedisNode = {
     val slot = JedisClusterCRC16.getSlot(key)
-    /* Master only */
+    getMasterNodeForSlot(nodes, slot)
+  }
+
+  /**
+    * Master node for a key
+    *
+    * @param nodes list of all nodes
+    * @param key   key
+    * @return master node
+    */
+  def getMasterNode(nodes: Array[RedisNode], key: Array[Byte]): RedisNode = {
+    val slot = JedisClusterCRC16.getSlot(key)
+    getMasterNodeForSlot(nodes, slot)
+  }
+
+  /**
+    * Master node for a slot
+    *
+    * @param nodes list of all nodes
+    * @param slot  slot
+    * @return master node
+    */
+  def getMasterNodeForSlot(nodes: Array[RedisNode], slot: Int): RedisNode = {
     nodes.filter { node => node.startSlot <= slot && node.endSlot >= slot }.filter(_.idx == 0)(0)
   }
 
   /**
     * @param nodes list of RedisNode
-    * @param keys  list of keys
+    * @param keys  list of keys (strings)
     * @return (node: (key1, key2, ...), node2: (key3, key4,...), ...)
     */
   def groupKeysByNode(nodes: Array[RedisNode], keys: Iterator[String]): Iterator[(RedisNode, Array[String])] = {
-    keys.map(key => (getMasterNode(nodes, key), key)).toArray.groupBy(_._1).
-      map(x => (x._1, x._2.map(_._2))).iterator
+    val nodeAndKeyTuples = keys.map { key => (getMasterNode(nodes, key), key) }
+    groupKeysByNode(nodeAndKeyTuples)
+  }
+
+  /**
+    * @param nodes list of RedisNode
+    * @param keys  list of keys (byte array)
+    * @return (node: (key1, key2, ...), node2: (key3, key4,...), ...)
+    */
+  def groupByteKeysByNode(nodes: Array[RedisNode], keys: Iterator[Array[Byte]]): Iterator[(RedisNode, Array[Array[Byte]])] = {
+    val nodeAndKeyTuples = keys.map { key => (getMasterNode(nodes, key), key) }
+    groupKeysByNode(nodeAndKeyTuples)
+  }
+
+  private def groupKeysByNode[K](nodeAndKeyTuples: Iterator[(RedisNode, K)]): Iterator[(RedisNode, Array[K])] = {
+    nodeAndKeyTuples.toArray.groupBy(_._1).map(x => (x._1, x._2.map(_._2))).iterator
   }
 
   /**
@@ -476,6 +586,20 @@ trait Keys {
     */
   def filterKeysByType(conn: Jedis, keys: Array[String], t: String)
                       (implicit readWriteConfig: ReadWriteConfig): Array[String] = {
+    val types = mapWithPipeline(conn, keys) { (pipeline, key) =>
+      pipeline.`type`(key)
+    }
+    keys.zip(types).filter(x => x._2 == t).map(x => x._1)
+  }
+
+  /**
+    * @param conn
+    * @param keys
+    * keys are guaranteed that they belongs with the server jedis connected to.
+    * @return keys of "t" type
+    */
+  def filterKeysByType(conn: Jedis, keys: Array[Array[Byte]], t: String)
+                      (implicit readWriteConfig: ReadWriteConfig): Array[Array[Byte]] = {
     val types = mapWithPipeline(conn, keys) { (pipeline, key) =>
       pipeline.`type`(key)
     }

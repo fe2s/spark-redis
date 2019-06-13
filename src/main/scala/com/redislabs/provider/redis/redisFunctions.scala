@@ -31,7 +31,7 @@ class RedisContext(@transient val sc: SparkContext) extends Serializable {
   }
 
   /**
-    * @param keys         an array of keys
+    * @param keys         an array of keys (strings)
     * @param partitionNum number of partitions
     * @return RedisKeysRDD of simple Keys stored in redis server
     */
@@ -42,6 +42,20 @@ class RedisContext(@transient val sc: SparkContext) extends Serializable {
                     readWriteConfig: ReadWriteConfig = ReadWriteConfig.fromSparkConf(sc.getConf)):
   RedisKeysRDD = {
     new RedisKeysRDD(sc, redisConfig, readWriteConfig, "", partitionNum, keys)
+  }
+
+  /**
+    * @param keys         an array of keys (byte arrays)
+    * @param partitionNum number of partitions
+    * @return RedisByteKeysRDD RDD of keys
+    */
+  def fromRedisKeys(keys: Array[Array[Byte]],
+                    partitionNum: Int = 3)
+                   (implicit
+                    redisConfig: RedisConfig = RedisConfig.fromSparkConf(sc.getConf),
+                    readWriteConfig: ReadWriteConfig = ReadWriteConfig.fromSparkConf(sc.getConf)):
+  RedisByteKeysRDD = {
+    new RedisByteKeysRDD(sc, redisConfig, readWriteConfig, partitionNum, keys)
   }
 
   /**
@@ -112,6 +126,24 @@ class RedisContext(@transient val sc: SparkContext) extends Serializable {
     keysOrKeyPattern match {
       case keyPattern: String => fromRedisKeyPattern(keyPattern, partitionNum).getHash()
       case keys: Array[String] => fromRedisKeys(keys, partitionNum).getHash()
+      case _ => throw new scala.Exception(IncorrectKeysOrKeyPatternMsg)
+    }
+  }
+
+  /**
+    * @param keysOrKeyPattern an array of keys (as byte array) or a key pattern
+    * @param partitionNum     number of partitions
+    * @return RedisHashRDD of related Key-Values stored in redis server
+    */
+  def fromRedisByteHash[T](keysOrKeyPattern: T,
+                       partitionNum: Int = 3)
+                      (implicit
+                       redisConfig: RedisConfig = RedisConfig.fromSparkConf(sc.getConf),
+                       readWriteConfig: ReadWriteConfig = ReadWriteConfig.fromSparkConf(sc.getConf)):
+  RDD[(Array[Byte], Array[Byte])] = {
+    keysOrKeyPattern match {
+      case keyPattern: String => fromRedisKeyPattern(keyPattern, partitionNum).getByteHash()
+      case keys: Array[Array[Byte]] => fromRedisKeys(keys, partitionNum).getHash()
       case _ => throw new scala.Exception(IncorrectKeysOrKeyPatternMsg)
     }
   }
